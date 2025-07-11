@@ -1,6 +1,7 @@
 import torch
 from torchvision.ops import sigmoid_focal_loss
 
+
 def rollwindow(tensor,dim = 2,size = 25, step = None) :
     """uses tensor.unfold to return a tensor containing sliding windows over the source.
     windows don't overlap by default, use the step parameter to change it."""
@@ -70,7 +71,9 @@ Typically used to compare the intermediary outputs of the decoder branch and the
     return 1-SSIM_product
 
 
-def compound_unet_loss(pred_scales,target,betas,gammas) :
+def compound_transunet_loss(pred_scales,target,betas,gammas) :
+
+    assert pred_scales[-1].shape == target.shape, f"pred shape: {pred_scales[-1].shape}, target shape: {target.shape}"
 
     focal_loss = sigmoid_focal_loss(pred_scales[-1],target,reduction="mean") #pixel level loss
     iou_loss  = IoU_loss(pred_scales[-1],target) #image level
@@ -78,4 +81,6 @@ def compound_unet_loss(pred_scales,target,betas,gammas) :
     ms_loss = torch.mean(ms_loss)
 
     return  ms_loss+focal_loss+iou_loss
+
+
 

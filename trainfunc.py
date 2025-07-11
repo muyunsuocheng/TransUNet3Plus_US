@@ -1,151 +1,127 @@
 from model import *
-from loss import compound_unet_loss
+from loss import compound_transunet_loss
 import os
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset,DataLoader
+from torch.utils.data import Dataset, DataLoader
 
-LOSS_EXPONENTS_BETA = [0.0448,0.2856,0.3001,0.2363,0.1333] #exponents used in MS-SSIM loss function in the UNET3+ paper
-LOSS_EXPONENTS_GAMMA = [0.0448,0.2856,0.3001,0.2363,0.1333] #results were found in MS SIM paper for a specific experiment, maybe not adapted to all datasets
+LOSS_EXPONENTS_BETA = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+LOSS_EXPONENTS_GAMMA = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
 
-def train(model : UNet3plus,
+def train(model: TransUNet3plus,
           data_train,
           data_test=None,
-          batch_size = 8,
-          epochs = 10 ,
-          early_stop_threshold = 1e-4,
-          early_stop_patience = 5,
-          input_image_size = 256,
-          save_model_directory = None
-          ) :
+          batch_size=8,
+          epochs=10,
+          early_stop_threshold=1e-4,
+          early_stop_patience=5,
+          input_image_size=256,
+          save_model_directory=None,
+          device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
 
-    dl_train, dl_test = DataLoader(data_train,batch_size), DataLoader(data_test,batch_size)
+    dl_train = DataLoader(data_train, batch_size, shuffle=True, pin_memory=False)
+    dl_test = DataLoader(data_test, batch_size, pin_memory=False) if data_test else None
 
-    optimizer_image = torch.optim.Adam(model.parameters())
-    optimizer_classification_arm = torch.optim.Adam(model.classifier.parameters())
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    resizer = nn.Upsample((input_image_size, input_image_size))
 
-    best_test_loss = torch.inf
+    best_test_loss = float('inf')
+    best_model_path = None
     patience = early_stop_patience
 
-    classifier_loss = nn.BCELoss()
-
-    resizer = nn.Upsample(input_image_size)
-
-
     for epoch in range(epochs):
+        print(f"\nEPOCH {epoch+1} / {epochs} :")
+        model.train()
+        train_loss_total = 0.0
+        train_loss_mask = 0.0
 
-        print(f"\nEPOCH {epoch+1} / {epochs} :  ")
-        train_loss_class = 0
-        train_loss_mask = 0
-        test_loss_mask = 0
-        test_loss_class = 0
-
-        with tqdm(dl_train) as train_batches_tqdm :
-
-            i = 1 #count batches for avg
-            for (image,mask,class_presence) in train_batches_tqdm :
-
-                optimizer_image.zero_grad()
-                optimizer_classification_arm.zero_grad()
-                model.classifier.requires_grad_ = False
+        # 训练循环
+        with tqdm(dl_train, desc=f"Epoch {epoch+1}/{epochs}") as train_batches:
+            for i, (image, mask) in enumerate(train_batches):
+                optimizer.zero_grad()
+                image = image.to(device)
+                mask = mask.to(device)
                 im_resized = resizer(image)
                 mask_resized = resizer(mask)
-
                 mask_output = model(im_resized)
 
-                # get predicted masks at different levels of upscaler and resize to same dimensions as ground truth
-                # masks have additional background class as first channel, remove it for loss
-                preds = [resizer(inter_mask)[:, 1:, ...] for inter_mask in
-                         [layer.side_mask_output for layer in model.sequp[:-1]]]
-                preds += [mask_output[:, 1:, ...]]
+                preds = []
+                for layer in model.sequp[:-1]:
+                    if hasattr(layer, 'side_mask_output') and layer.side_mask_output is not None:
+                        pred = resizer(layer.side_mask_output)
+                        if pred.shape[1] > 1:
+                            pred = pred[:, 1:, ...]
+                        preds.append(pred)
+                final_pred = mask_output
+                if final_pred.shape[1] > 1:
+                    final_pred = final_pred[:, 1:, ...]
+                preds.append(final_pred)
+                target = mask_resized[:, 1:, ...] if mask_resized.shape[1] > 1 else mask_resized
 
-
-                image_loss= compound_unet_loss(preds,mask_resized[:, 1:, ...],LOSS_EXPONENTS_BETA,LOSS_EXPONENTS_GAMMA)
+                image_loss = compound_transunet_loss(preds, target, LOSS_EXPONENTS_BETA, LOSS_EXPONENTS_GAMMA)
+                total_loss = image_loss
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_loss_total += total_loss.item()
                 train_loss_mask += image_loss.item()
-                image_loss.backward(retain_graph=True)
+                train_batches.set_postfix({
+                    'Total Loss': f"{train_loss_total/(i+1):.5f}",
+                    'Seg Loss': f"{train_loss_mask/(i+1):.5f}"
+                })
 
-                optimizer_image.step()
-
-                #independent backward pass on classifier
-                model.classifier.requires_grad = True
-
-                model.seqdown.requires_grad = False
-                model.sequp.requires_grad = False
-
-                class_loss = classifier_loss(model.presence_prediction[:,1:],class_presence[:,1:])
-                train_loss_class += class_loss.item()
-                class_loss.backward()
-                optimizer_classification_arm.step()
-
-                model.seqdown.requires_grad = True
-                model.sequp.requires_grad = True
-
-
-                train_batches_tqdm.set_description(f" TRAIN --- Seg. Loss :{train_loss_mask/i:.5f} | Class.Loss :{train_loss_class/i:.5f}")
-
-                i+=1
-
-        if dl_test :
-
-            with tqdm(dl_test) as test_batches_tqdm:
-
-
-                i = 1  # count batches for avg
-                for (image, mask, class_presence) in test_batches_tqdm:
-
-                    im_resized = resizer(image)
-                    mask_resized = resizer(mask)
-                    mask_output = model(im_resized)
-
-                    #get predicted masks (skipping first background class) at different levels of upscaler and resize to same dimensions as ground truth
-
-                    preds = [resizer(inter_mask)[:,1:,...] for inter_mask in [layer.side_mask_output for layer in model.sequp[:-1]]]
-                    preds += [mask_output[:,1:,...]]
-
-                    image_loss = compound_unet_loss(preds, mask_resized[:,1:,...], LOSS_EXPONENTS_BETA, LOSS_EXPONENTS_GAMMA)
-                    presence_loss = classifier_loss(model.presence_prediction, class_presence)
-
-                    test_loss_class += presence_loss.item()
-                    test_loss_mask += image_loss.item()
-
-                    test_batches_tqdm.set_description(
-                        f" TEST ---  Seg. Loss :{test_loss_mask / i:.5f} | Class.Loss :{test_loss_class / i:.5f}")
-
-                    i += 1
-
-            if test_loss_mask + early_stop_threshold < best_test_loss :
-
-                patience == early_stop_patience
-                best_test_loss = test_loss_mask
-                if save_model_directory is not None :
-                    filename = save_model_directory+"/best.pt"
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                    torch.save(model,filename)
-
-
-            else :
-                patience -= 1
-                if patience == 0 :
-                    print(f"Early stopping at epoch {epoch+1} : {early_stop_patience} epochs without improvement")
-                    if save_model_directory is not None:
-                        filename = save_model_directory + "/last.pt"
-                        os.makedirs(os.path.dirname(filename), exist_ok=True)
-                        torch.save(model, filename)
-                    return
-        else :
-            if epoch %5 == 0 :
-                filename = save_model_directory + "/last_5th_epoch.pt"
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-                torch.save(model, filename)
-
-    if save_model_directory is not None:
-        filename = save_model_directory + "/last.pt"
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        torch.save(model, filename)
-    return
-
-
-
-
+        # 测试循环
+        if dl_test:
+            model.eval()
+            test_loss_total = 0.0
+            test_loss_mask = 0.0
+            with torch.no_grad():
+                with tqdm(dl_test, desc="Testing") as test_batches:
+                    for i, batch in enumerate(test_batches):
+                        # 兼容测试集只有image的情况
+                        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                            image, mask = batch
+                            mask = mask.to(device)
+                        else:
+                            image = batch
+                            mask = None
+                        image = image.to(device)
+                        im_resized = resizer(image)
+                        mask_output = model(im_resized)
+                        preds = []
+                        for layer in model.sequp[:-1]:
+                            if hasattr(layer, 'side_mask_output') and layer.side_mask_output is not None:
+                                pred = resizer(layer.side_mask_output)
+                                if pred.shape[1] > 1:
+                                    pred = pred[:, 1:, ...]
+                                preds.append(pred)
+                        final_pred = mask_output
+                        if final_pred.shape[1] > 1:
+                            final_pred = final_pred[:, 1:, ...]
+                        preds.append(final_pred)
+                        if mask is not None:
+                            mask_resized = resizer(mask)
+                            target = mask_resized[:, 1:, ...] if mask_resized.shape[1] > 1 else mask_resized
+                            image_loss = compound_transunet_loss(preds, target, LOSS_EXPONENTS_BETA, LOSS_EXPONENTS_GAMMA)
+                            total_loss = image_loss
+                            test_loss_total += total_loss.item()
+                            test_loss_mask += image_loss.item()
+                            test_batches.set_postfix({
+                                'Total Loss': f"{test_loss_total/(i+1):.5f}",
+                                'Seg Loss': f"{test_loss_mask/(i+1):.5f}"
+                            })
+            avg_test_loss = test_loss_total / len(dl_test)
+            if avg_test_loss < best_test_loss:
+                best_test_loss = avg_test_loss
+                if save_model_directory:
+                    os.makedirs(save_model_directory, exist_ok=True)
+                    best_model_path = os.path.join(save_model_directory, "best_model.pth")
+                    torch.save(model.state_dict(), best_model_path)
+                    print(f"保存最优模型权重于: {best_model_path} (Test Loss: {avg_test_loss:.5f})")
+    
+    # 保存最终模型
+    if save_model_directory:
+        os.makedirs(save_model_directory, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(save_model_directory, "final_model.pth"))
