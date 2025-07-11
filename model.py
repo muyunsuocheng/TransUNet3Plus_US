@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+from torchvision.transforms.functional import to_pil_image
 
 class ULayerDown(nn.Module):
-    """Downward layer of UNET module, contains a 2D convolution layer, an activation function and a Maxpooling layer.
+    """Downward layer of TransUNET module, contains a 2D convolution layer, an activation function and a Maxpooling layer.
 Stores its forward outputs for referencing by upwards layers."""
     def __init__(self,channels_in,channels_out, **layer_kwargs):
 
@@ -10,7 +11,6 @@ Stores its forward outputs for referencing by upwards layers."""
         self.conv_layer = nn.Conv2d(channels_in,channels_out,3,**layer_kwargs)
         self.activation = nn.ReLU()
         self.scale_layer = nn.MaxPool2d(2,padding=1)
-
 
         self.output = None
 
@@ -25,11 +25,10 @@ Stores its forward outputs for referencing by upwards layers."""
 
 class ULayerUp(nn.Module) :
     def __init__(self,single_feature_map_channels,n_classes,mask_shape,connected_nodes,_device="cuda", **layer_kwargs):
-        """Upwards layer of UNET. handles concatenation and down/upsampling according to source layers and their levels.
+        """Upwards layer of TransUNET. handles concatenation and down/upsampling according to source layers and their levels.
         produces a side output corresponding to the mask predicted at this scale"""
 
         super().__init__()
-
 
         self.channels_per_fmap = single_feature_map_channels
         self.conv_layer = nn.Conv2d(self.channels_per_fmap*(len(connected_nodes)+1), self.channels_per_fmap, 3,padding=1, **layer_kwargs)
@@ -51,7 +50,6 @@ class ULayerUp(nn.Module) :
         self.side_mask_output = None
 
         # add appropriate scaling/conv pipeline to the output of other layers
-
         for node in connected_nodes :
             self.prep_layers.append(nn.Conv2d(node.conv_layer.out_channels,
                                                               self.channels_per_fmap,3,padding=1).to(self.device))
@@ -78,7 +76,6 @@ class ULayerUp(nn.Module) :
 class ClassificationArm(nn.Module) :
     """proposed classification module to make the model more robust to negative images by predicting class presence
     in images from the deepest encoding layer and multiplying output masks during training.
-
     """
     def __init__(self,in_channels,n_classes,input_size=25):
         super().__init__()
@@ -102,12 +99,52 @@ class ClassificationArm(nn.Module) :
         Y = self.sequence(X)
         return self.sig_layer(Y)
 
+# 定义Transformer层
+class TransformerLayer(nn.Module):
+    def __init__(self, dim, num_heads=4, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.msa = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(dropout)
+        )
 
+    def forward(self, x):
+        # 第一个残差连接：输入 -> LN -> MSA -> 残差
+        x_res = x
+        x = self.norm1(x)
+        x, _ = self.msa(x, x, x)
+        x = x_res + x
+        
+        # 第二个残差连接：MSA输出 -> LN -> MLP -> 残差
+        x_res2 = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x_res2 + x
+        return x
 
+# 定义包含四层的Transformer块
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads=4, depth=4, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerLayer(dim, num_heads, mlp_ratio, dropout)
+            for _ in range(depth)
+        ])
+        self.norm_final = nn.LayerNorm(dim)
 
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm_final(x)
 
-class UNet3plus(nn.Module) :
-    """UNET3+ autoencoder for semantic segmentation."""
+class TransUNet3plus(nn.Module) :
+    """TransUNET3+ autoencoder for semantic segmentation with Transformer block."""
     def __init__(self,
                  n_classes = 2,
                  in_channels = 3,
@@ -126,40 +163,36 @@ class UNet3plus(nn.Module) :
 
         self.seqdown = nn.Sequential(*down_layers)
 
+        # 添加Transformer模块
+        self.transformer = TransformerBlock(
+            dim=upwards_feature_channels,
+            num_heads=4,
+            depth=4,  # 四层Transformer
+            mlp_ratio=4.0,
+            dropout=0.1
+        )
+
         up_layers = []
-
         for i in range(depth) :
-
             up_layers.append(ULayerUp(upwards_feature_channels,
                             n_classes,
                             mask_shape = sideways_mask_shape,
                             connected_nodes= down_layers[:depth-1-i]+ up_layers ))
 
         self.sequp = nn.Sequential(*up_layers)
-
-        self.classifier = ClassificationArm(upwards_feature_channels,n_classes)
-
         self.last_layer = nn.Conv2d(upwards_feature_channels,n_classes,3,padding=1)
-
         self._side_mask_shape = sideways_mask_shape
 
-        self.presence_prediction = None
-
     def forward(self,X):
-
         Y = nn.functional.normalize(X,dim=1)
         Y = self.seqdown(Y)
+        B, C, H, W = Y.shape
+        Y_flat = Y.flatten(2).transpose(1, 2)
+        Y_transformed = self.transformer(Y_flat)
+        Y = Y_transformed.transpose(1, 2).reshape(B, C, H, W)
         Y = nn.Upsample(scale_factor=2)(Y)
-        self.presence_prediction = self.classifier(Y)
-
         Y = self.sequp(Y)
-
-        for layer in self.sequp :
-            layer.side_mask_output *= self.presence_prediction.unsqueeze(-1).unsqueeze(-1)
-
         Y = self.last_layer(Y)
-        Y*= self.presence_prediction.unsqueeze(-1).unsqueeze(-1)
-        Y = nn.Upsample(X.shape[-2:])(Y)
+        Y = torch.nn.functional.interpolate(Y, size=X.shape[-2:], mode='nearest')
         return nn.Softmax(dim=1)(Y)
-
 
